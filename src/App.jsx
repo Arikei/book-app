@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import './App.css'
 import BarcodeScanner from './BarcodeScanner'
 import { supabase } from './supabaseClient'
 
@@ -9,63 +8,44 @@ function App() {
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [filterText, setFilterText] = useState("");
   const [sortOrder, setSortOrder] = useState("newest");
-  
   const [scanMessage, setScanMessage] = useState("");
   
-  // バーコード連続読み取り防止用
   const lastScannedIsbnRef = useRef(null);
-  // オーディオコンテキスト再利用用（音切れ防止）
   const audioContextRef = useRef(null);
 
-  // 関数を固定化(useCallback)して、useEffectの依存関係を正しくする
+  // --- ロジック部分は変更なし ---
   const fetchBooks = useCallback(async () => {
     const { data, error } = await supabase
       .from('books')
       .select('*')
       .order('created_at', { ascending: false });
-
     if (error) console.error('Error:', error);
     else setBooks(data);
   }, []);
 
-  useEffect(() => {
-    fetchBooks();
-  }, [fetchBooks]);
+  useEffect(() => { fetchBooks(); }, [fetchBooks]);
 
-  // 音を鳴らす（AudioContextを使い回す修正版）
   const playBeep = useCallback(() => {
     try {
       if (!audioContextRef.current) {
         audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       }
       const ctx = audioContextRef.current;
-      
-      // サスペンド状態なら再開
-      if (ctx.state === 'suspended') {
-        ctx.resume();
-      }
-
+      if (ctx.state === 'suspended') ctx.resume();
       const oscillator = ctx.createOscillator();
       const gainNode = ctx.createGain();
-      
       oscillator.connect(gainNode);
       gainNode.connect(ctx.destination);
-      
       oscillator.type = 'sine';
       oscillator.frequency.setValueAtTime(1000, ctx.currentTime);
       gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
-      
       oscillator.start();
       oscillator.stop(ctx.currentTime + 0.1);
-    } catch (e) {
-      console.log("音の再生に失敗しましたが続行します", e);
-    }
+    } catch (e) { console.log("音再生失敗", e); }
   }, []);
 
-  // 書籍追加ロジック（useCallbackで固定）
   const addBookToDB = useCallback(async (bookData) => {
     let insertData = { status: '未読' };
-
     if (typeof bookData === 'string') {
       insertData = { ...insertData, title: bookData };
     } else {
@@ -78,16 +58,9 @@ function App() {
         status: '未読'
       };
     }
-
     const { error } = await supabase.from('books').insert([insertData]);
-
-    if (error) {
-      console.error('Error:', error);
-      alert(`保存エラー: ${error.message}`);
-    } else {
-      // 本を追加してもfetchBooksを呼ぶだけで、画面全体のリロードは走らせない
-      fetchBooks();
-    }
+    if (error) { alert(`保存エラー: ${error.message}`); }
+    else { fetchBooks(); }
   }, [fetchBooks]);
 
   const handleAddBook = () => {
@@ -102,7 +75,6 @@ function App() {
     else fetchBooks();
   };
 
-  // スキャンロック解除（useCallbackで固定）
   const resetScanLock = useCallback(() => {
     setTimeout(() => {
       setScanMessage("");
@@ -110,47 +82,32 @@ function App() {
     }, 3000);
   }, []);
 
-  // 成功メッセージ表示（useCallbackで固定）
   const showSuccessMessage = useCallback((title) => {
     setScanMessage(`✅ 追加: ${title}`);
     resetScanLock();
   }, [resetScanLock]);
 
-  // ★重要修正: スキャン成功時の処理を useCallback で完全に固定
-  // これにより、この関数が再生成されず、カメラコンポーネントに「変更なし」と伝わります
   const handleScanSuccess = useCallback(async (isbn) => {
-    // 読み込み済みチェック
     if (lastScannedIsbnRef.current === isbn) return;
-    // 978または979で始まる13桁の番号のみ許可
     if (!isbn.match(/^(978|979)/)) return;
-
     lastScannedIsbnRef.current = isbn;
     playBeep();
 
     try {
-      // 作戦1: OpenBD
       const resOpenBD = await fetch(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
       const dataOpenBD = await resOpenBD.json();
-
       if (dataOpenBD[0] && dataOpenBD[0].summary) {
         const bookInfo = dataOpenBD[0].summary;
-        // DB追加処理を待機
         await addBookToDB(bookInfo);
         showSuccessMessage(bookInfo.title);
         return;
       }
 
-      // 作戦2: Google Books API
       const resGoogle = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`);
       const dataGoogle = await resGoogle.json();
-
       if (dataGoogle.items && dataGoogle.items.length > 0) {
         const info = dataGoogle.items[0].volumeInfo;
-        
-        const coverImage = (info.imageLinks && info.imageLinks.thumbnail) 
-          ? info.imageLinks.thumbnail.replace('http://', 'https://') 
-          : '';
-
+        const coverImage = (info.imageLinks && info.imageLinks.thumbnail) ? info.imageLinks.thumbnail.replace('http://', 'https://') : '';
         const googleBookData = {
           title: info.title || "タイトル不明",
           author: info.authors ? info.authors.join(', ') : '著者不明',
@@ -158,177 +115,190 @@ function App() {
           cover: coverImage,
           isbn: isbn
         };
-
         await addBookToDB(googleBookData);
         showSuccessMessage(googleBookData.title);
-
       } else {
         setScanMessage("⚠️ 情報が見つかりませんでした");
         resetScanLock();
       }
-
     } catch (error) {
-      console.error("検索エラー:", error);
-      // アラートはカメラを止める原因になることがあるので、ここでの使用は控えめにするか
-      // UIでエラー表示するのがベターですが、一旦そのままにします
       alert(`エラー: ${error.message}`); 
       resetScanLock();
     }
-  }, [addBookToDB, playBeep, showSuccessMessage, resetScanLock]); // 依存配列
+  }, [addBookToDB, playBeep, showSuccessMessage, resetScanLock]);
 
   const handleStatusChange = async (id, newStatus) => {
-    // UIを即時更新（楽観的UI更新）
-    const updatedBooks = books.map(book =>
-      book.id === id ? { ...book, status: newStatus } : book
-    );
+    const updatedBooks = books.map(book => book.id === id ? { ...book, status: newStatus } : book);
     setBooks(updatedBooks);
-    
-    // 裏でDB更新
-    const { error } = await supabase
-      .from('books').update({ status: newStatus }).eq('id', id);
-    
-    // エラーがあった場合のみ書き戻す（再取得）
+    const { error } = await supabase.from('books').update({ status: newStatus }).eq('id', id);
     if (error) fetchBooks();
   };
   
-  // ★パフォーマンス修正: useMemoでフィルタリング計算をキャッシュ
   const displayBooks = useMemo(() => {
-    let filtered = books.filter(book =>
-      book.title.toLowerCase().includes(filterText.toLowerCase())
-    );
-  
-    if (sortOrder === "newest") {
-      filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    } else if (sortOrder === "oldest") {
-      filtered.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-    } else if (sortOrder === "status") {
+    let filtered = books.filter(book => book.title.toLowerCase().includes(filterText.toLowerCase()));
+    if (sortOrder === "newest") filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    else if (sortOrder === "oldest") filtered.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    else if (sortOrder === "status") {
       const statusOrder = { "未読": 1, "読書中": 2, "読了": 3 };
-      filtered.sort((a, b) =>
-        (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99)
-      );
+      filtered.sort((a, b) => (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99));
     }
     return filtered;
-  }, [books, filterText, sortOrder]); // これらの値が変わった時だけ再計算
+  }, [books, filterText, sortOrder]);
+
+  // --- ここからデザイン部分 ---
 
   return (
-    <>
-      <div style={{ padding: "20px", maxWidth: "600px", margin: "0 auto" }}>
-        <h1 style={{ color: "#333" }}>書籍リスト管理 (Safe v3)</h1>
+    // 背景: 全体に淡いグラデーションをかける
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-pink-50 text-slate-700 font-sans pb-20">
+      
+      {/* ヘッダーエリア */}
+      <div className="pt-10 pb-6 px-4">
+        <h1 className="text-4xl font-extrabold text-center text-transparent bg-clip-text bg-gradient-to-r from-violet-600 to-indigo-600 drop-shadow-sm mb-2">
+          My Library
+        </h1>
+        <p className="text-center text-slate-500 text-sm">読書記録をもっと楽しく</p>
+      </div>
 
-        <div style={{ marginBottom: "30px" }}>
-          <input
-            type="text"
-            placeholder="タイトルを手動入力"
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            style={{ padding: "8px", width: "60%" }}
-          />
-          <button onClick={handleAddBook} style={{ marginLeft: "5px", padding: "8px 15px" }}>追加</button>
-        </div>
+      <div className="max-w-xl mx-auto px-4">
+        
+        {/* メインコントロールパネル (すりガラス風) */}
+        <div className="bg-white/70 backdrop-blur-lg border border-white/50 rounded-3xl p-6 shadow-xl mb-8">
+          
+          {/* 追加フォーム */}
+          <div className="flex gap-2 mb-6">
+            <input
+              type="text"
+              placeholder="タイトルを入力..."
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              className="flex-1 px-4 py-3 bg-white/50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-400 focus:bg-white transition placeholder-slate-400"
+            />
+            <button 
+              onClick={handleAddBook} 
+              className="bg-gradient-to-r from-violet-500 to-fuchsia-500 hover:from-violet-600 hover:to-fuchsia-600 text-white font-bold py-3 px-6 rounded-xl shadow-lg shadow-violet-200 transition-all active:scale-95"
+            >
+              ＋
+            </button>
+          </div>
 
-        <div style={{ marginBottom: "20px" }}>
+          {/* カメラボタン */}
           <button
             onClick={() => setIsCameraOpen(!isCameraOpen)}
-            style={{ 
-              backgroundColor: isCameraOpen ? "#ff9800" : "#4CAF50",
-              color: "white", padding: "10px", border: "none", cursor: "pointer", width: "100%", borderRadius: "5px", fontSize: "16px", fontWeight: "bold" 
-            }}
+            className={`w-full py-4 rounded-xl font-bold text-white shadow-lg transition-all transform active:scale-95 flex justify-center items-center gap-2
+              ${isCameraOpen 
+                ? "bg-slate-700 hover:bg-slate-800" 
+                : "bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600 shadow-cyan-200"}`}
           >
-            {isCameraOpen ? "カメラを停止する" : "📷 連続スキャンモード開始"}
+            {isCameraOpen ? "📷 カメラを閉じる" : "📷 バーコードで追加"}
           </button>
           
+          {/* スキャンメッセージ */}
           {scanMessage && (
-            <div style={{
-              marginTop: "10px", padding: "10px", backgroundColor: "#e0f7fa", 
-              color: "#006064", borderRadius: "5px", fontWeight: "bold"
-            }}>
+            <div className="mt-4 p-3 bg-emerald-50/90 text-emerald-700 border border-emerald-100 rounded-xl text-center font-bold animate-bounce">
               {scanMessage}
             </div>
           )}
 
+          {/* カメラ表示エリア */}
           {isCameraOpen && (
-            <div style={{ marginTop: "10px" }}>
-              {/* handleScanSuccessはuseCallbackで固定されているため、カメラは再起動しません */}
+            <div className="mt-6 overflow-hidden rounded-2xl shadow-inner border-4 border-slate-200">
               <BarcodeScanner onScan={handleScanSuccess} />
             </div>
           )}
         </div>
         
-        <div style={{marginBottom:"20px", padding:"15px", backgroundColor:"#f5f5f5", borderRadius:"8px"}}>
-          <div style={{marginBottom:"10px"}}>
-            <label style={{ color: "#333" }}>🔍 検索: </label>
+        {/* 検索・ソートバー */}
+        <div className="flex flex-col sm:flex-row gap-3 mb-6 items-center justify-between bg-white/40 p-2 rounded-2xl">
+          <div className="relative w-full sm:w-auto flex-1">
+            <span className="absolute left-3 top-2.5 text-slate-400">🔍</span>
             <input
               type="text"
-              placeholder="タイトルで絞り込み"
+              placeholder="本を探す..."
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
-              style={{width:"70%", padding:"5px"}}
+              className="w-full pl-9 pr-4 py-2 bg-transparent border-b border-slate-300 focus:border-violet-500 focus:outline-none transition"
             />
           </div>
-          <div>
-            <label style={{ color: "#333" }}>⇅ 並び替え: </label>
-            <select
-              value={sortOrder}
-              onChange={(e) => setSortOrder(e.target.value)}
-              style={{padding:"5px"}}
-            >
-              <option value="newest">新しい順</option>
-              <option value="oldest">古い順</option>
-              <option value="status">ステータス順</option>
-            </select>
-          </div>
+          <select
+            value={sortOrder}
+            onChange={(e) => setSortOrder(e.target.value)}
+            className="text-sm bg-white/80 border-none rounded-lg px-3 py-2 text-slate-600 shadow-sm focus:ring-2 focus:ring-violet-200 cursor-pointer"
+          >
+            <option value="newest">📅 新しい順</option>
+            <option value="oldest">📅 古い順</option>
+            <option value="status">🔖 状態で並替</option>
+          </select>
         </div>
 
-        <ul style={{ listStyle: "none", padding: 0 }}>
+        {/* 書籍リスト */}
+        <div className="space-y-4">
           {displayBooks.map((book) => (
-            <li key={book.id} style={{
-              borderBottom: "1px solid #ddd",
-              padding: "15px",
-              display: "flex",
-              alignItems: "flex-start",
-              gap: "15px",
-              backgroundColor: book.status === "読了" ? "#f0f8ff" : "#fff" 
-            }}>
-              {book.cover_url ? (
-                <img src={book.cover_url} alt={book.title} style={{ width: "60px", boxShadow: "2px 2px 5px rgba(0,0,0,0.2)" }} />
-              ) : (
-                <div style={{ width: "60px", height: "80px", backgroundColor: "#eee", display:"flex", alignItems:"center", justifyContent:"center", fontSize:"10px", color:"#888" }}>No Image</div>
-              )}
+            <div 
+              key={book.id} 
+              className={`group relative flex gap-4 p-4 rounded-2xl transition-all duration-300 hover:-translate-y-1
+                ${book.status === "読了" ? "bg-slate-100/80 opacity-75 grayscale-[0.5]" : "bg-white/80 backdrop-blur shadow-lg shadow-indigo-100/50 hover:shadow-xl hover:shadow-indigo-200/50"}
+                ${book.status === "読書中" ? "ring-2 ring-amber-300 bg-amber-50/50" : ""}
+              `}
+            >
+              {/* 表紙画像 (浮き出るような影) */}
+              <div className="flex-shrink-0 w-24 h-32 rounded-lg overflow-hidden shadow-md group-hover:shadow-lg transition">
+                {book.cover_url ? (
+                  <img src={book.cover_url} alt={book.title} className="w-full h-full object-cover" />
+                ) : (
+                  <div className="w-full h-full bg-slate-200 flex items-center justify-center text-xs text-slate-400">No Image</div>
+                )}
+              </div>
 
-              <div style={{ flex: 1, textAlign: "left" }}>
-                <h3 style={{ margin: "0 0 5px 0", fontSize: "16px", color: "#333" }}>{book.title}</h3>
-                <p style={{ margin: "0 0 10px 0", fontSize: "14px", color: "#555" }}>
-                  {book.author}
-                </p>
-
-                <div style={{ marginBottom: "10px" }}>
-                  <select 
-                    value={book.status || "未読"} 
-                    onChange={(e) => handleStatusChange(book.id, e.target.value)}
-                    style={{ 
-                      padding: "5px", 
-                      borderRadius: "4px",
-                      backgroundColor: book.status === "読書中" ? "#fffacd" : (book.status === "読了" ? "#e0ffff" : "#fff")
-                    }}
-                  >
-                    <option value="未読">📕 未読</option>
-                    <option value="読書中">📖 読書中</option>
-                    <option value="読了">✅ 読了</option>
-                  </select>
+              {/* 書籍情報 */}
+              <div className="flex-1 flex flex-col justify-between py-1">
+                <div>
+                  <h3 className="text-lg font-bold text-slate-800 leading-snug mb-1 line-clamp-2">{book.title}</h3>
+                  <p className="text-sm text-slate-500">{book.author}</p>
                 </div>
 
-                <button
-                  onClick={() => handleDeleteBook(book.id)}
-                  style={{ backgroundColor: "#ff4d4d", color: "white", border: "none", padding: "5px 10px", cursor: "pointer", borderRadius: "4px", fontSize: "12px" }}
-                >
-                  削除
-                </button>
+                <div className="flex justify-between items-center mt-3">
+                  {/* ステータスバッジ */}
+                  <div className="relative">
+                    <select 
+                      value={book.status || "未読"} 
+                      onChange={(e) => handleStatusChange(book.id, e.target.value)}
+                      className={`appearance-none text-xs font-bold py-1.5 pl-3 pr-8 rounded-full cursor-pointer transition focus:outline-none focus:ring-2 focus:ring-offset-1
+                        ${book.status === "未読" ? "bg-rose-100 text-rose-600 hover:bg-rose-200" : ""}
+                        ${book.status === "読書中" ? "bg-amber-100 text-amber-600 hover:bg-amber-200" : ""}
+                        ${book.status === "読了" ? "bg-emerald-100 text-emerald-600 hover:bg-emerald-200" : ""}
+                      `}
+                    >
+                      <option value="未読">📕 未読</option>
+                      <option value="読書中">📖 読書中</option>
+                      <option value="読了">✅ 読了</option>
+                    </select>
+                    {/* カスタム矢印 */}
+                    <div className="absolute right-3 top-1/2 transform -translate-y-1/2 pointer-events-none text-xs opacity-50">
+                      ▼
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => handleDeleteBook(book.id)}
+                    className="w-8 h-8 flex items-center justify-center rounded-full text-slate-300 hover:bg-slate-100 hover:text-rose-500 transition"
+                  >
+                    🗑️
+                  </button>
+                </div>
               </div>
-            </li>
+            </div>
           ))}
-        </ul>
+
+          {displayBooks.length === 0 && (
+            <div className="text-center py-16 opacity-50">
+              <div className="text-6xl mb-4">📚</div>
+              <p className="text-lg">本棚は空っぽです</p>
+              <p className="text-sm">バーコードをスキャンして追加しよう</p>
+            </div>
+          )}
+        </div>
       </div>
-    </>
+    </div>
   )
 }
 
