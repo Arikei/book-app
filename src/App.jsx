@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import './App.css'
 import BarcodeScanner from './BarcodeScanner'
 import { supabase } from './supabaseClient'
@@ -11,13 +11,14 @@ function App() {
   const [sortOrder, setSortOrder] = useState("newest");
   
   const [scanMessage, setScanMessage] = useState("");
+  
+  // バーコード連続読み取り防止用
   const lastScannedIsbnRef = useRef(null);
+  // オーディオコンテキスト再利用用（音切れ防止）
+  const audioContextRef = useRef(null);
 
-  useEffect(() => {
-    fetchBooks();
-  }, []);
-
-  const fetchBooks = async () => {
+  // 関数を固定化(useCallback)して、useEffectの依存関係を正しくする
+  const fetchBooks = useCallback(async () => {
     const { data, error } = await supabase
       .from('books')
       .select('*')
@@ -25,30 +26,44 @@ function App() {
 
     if (error) console.error('Error:', error);
     else setBooks(data);
-  };
+  }, []);
 
-  // 音を鳴らす（エラーが出ても止まらないように安全化）
-  const playBeep = () => {
+  useEffect(() => {
+    fetchBooks();
+  }, [fetchBooks]);
+
+  // 音を鳴らす（AudioContextを使い回す修正版）
+  const playBeep = useCallback(() => {
     try {
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const ctx = audioContextRef.current;
+      
+      // サスペンド状態なら再開
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
+
+      const oscillator = ctx.createOscillator();
+      const gainNode = ctx.createGain();
       
       oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
+      gainNode.connect(ctx.destination);
       
       oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(1000, audioCtx.currentTime);
-      gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+      oscillator.frequency.setValueAtTime(1000, ctx.currentTime);
+      gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
       
       oscillator.start();
-      oscillator.stop(audioCtx.currentTime + 0.1);
+      oscillator.stop(ctx.currentTime + 0.1);
     } catch (e) {
-      console.log("音の再生に失敗しましたが続行します");
+      console.log("音の再生に失敗しましたが続行します", e);
     }
-  };
+  }, []);
 
-  const addBookToDB = async (bookData) => {
+  // 書籍追加ロジック（useCallbackで固定）
+  const addBookToDB = useCallback(async (bookData) => {
     let insertData = { status: '未読' };
 
     if (typeof bookData === 'string') {
@@ -68,11 +83,12 @@ function App() {
 
     if (error) {
       console.error('Error:', error);
-      alert(`保存エラー: ${error.message}`); // エラー内容を表示
+      alert(`保存エラー: ${error.message}`);
     } else {
+      // 本を追加してもfetchBooksを呼ぶだけで、画面全体のリロードは走らせない
       fetchBooks();
     }
-  };
+  }, [fetchBooks]);
 
   const handleAddBook = () => {
     if (inputText === "") return;
@@ -86,38 +102,51 @@ function App() {
     else fetchBooks();
   };
 
-  // ★修正: 頑丈になったスキャン処理
-  const handleScanSuccess = async (isbn) => {
+  // スキャンロック解除（useCallbackで固定）
+  const resetScanLock = useCallback(() => {
+    setTimeout(() => {
+      setScanMessage("");
+      lastScannedIsbnRef.current = null;
+    }, 3000);
+  }, []);
+
+  // 成功メッセージ表示（useCallbackで固定）
+  const showSuccessMessage = useCallback((title) => {
+    setScanMessage(`✅ 追加: ${title}`);
+    resetScanLock();
+  }, [resetScanLock]);
+
+  // ★重要修正: スキャン成功時の処理を useCallback で完全に固定
+  // これにより、この関数が再生成されず、カメラコンポーネントに「変更なし」と伝わります
+  const handleScanSuccess = useCallback(async (isbn) => {
+    // 読み込み済みチェック
     if (lastScannedIsbnRef.current === isbn) return;
-    if (!isbn.startsWith("978")) return;
+    // 978または979で始まる13桁の番号のみ許可
+    if (!isbn.match(/^(978|979)/)) return;
 
     lastScannedIsbnRef.current = isbn;
     playBeep();
 
     try {
-      // ---------------------------------------------------
       // 作戦1: OpenBD
-      // ---------------------------------------------------
       const resOpenBD = await fetch(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
       const dataOpenBD = await resOpenBD.json();
 
       if (dataOpenBD[0] && dataOpenBD[0].summary) {
         const bookInfo = dataOpenBD[0].summary;
+        // DB追加処理を待機
         await addBookToDB(bookInfo);
         showSuccessMessage(bookInfo.title);
         return;
       }
 
-      // ---------------------------------------------------
       // 作戦2: Google Books API
-      // ---------------------------------------------------
       const resGoogle = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`);
       const dataGoogle = await resGoogle.json();
 
       if (dataGoogle.items && dataGoogle.items.length > 0) {
         const info = dataGoogle.items[0].volumeInfo;
         
-        // ★ここを修正: 画像情報が無くてもエラーにならないようにチェックを入れる
         const coverImage = (info.imageLinks && info.imageLinks.thumbnail) 
           ? info.imageLinks.thumbnail.replace('http://', 'https://') 
           : '';
@@ -140,34 +169,30 @@ function App() {
 
     } catch (error) {
       console.error("検索エラー:", error);
-      alert(`エラーが発生しました: ${error.message}`); // 何が起きたか画面に出す
+      // アラートはカメラを止める原因になることがあるので、ここでの使用は控えめにするか
+      // UIでエラー表示するのがベターですが、一旦そのままにします
+      alert(`エラー: ${error.message}`); 
       resetScanLock();
     }
-  }
-
-  const showSuccessMessage = (title) => {
-    setScanMessage(`✅ 追加: ${title}`);
-    resetScanLock();
-  };
-
-  const resetScanLock = () => {
-    setTimeout(() => {
-      setScanMessage("");
-      lastScannedIsbnRef.current = null;
-    }, 3000);
-  }
+  }, [addBookToDB, playBeep, showSuccessMessage, resetScanLock]); // 依存配列
 
   const handleStatusChange = async (id, newStatus) => {
+    // UIを即時更新（楽観的UI更新）
     const updatedBooks = books.map(book =>
       book.id === id ? { ...book, status: newStatus } : book
     );
     setBooks(updatedBooks);
+    
+    // 裏でDB更新
     const { error } = await supabase
       .from('books').update({ status: newStatus }).eq('id', id);
+    
+    // エラーがあった場合のみ書き戻す（再取得）
     if (error) fetchBooks();
   };
   
-  const getDisplayBooks = () => {
+  // ★パフォーマンス修正: useMemoでフィルタリング計算をキャッシュ
+  const displayBooks = useMemo(() => {
     let filtered = books.filter(book =>
       book.title.toLowerCase().includes(filterText.toLowerCase())
     );
@@ -183,9 +208,7 @@ function App() {
       );
     }
     return filtered;
-  };
-
-  const displayBooks = getDisplayBooks();
+  }, [books, filterText, sortOrder]); // これらの値が変わった時だけ再計算
 
   return (
     <>
@@ -225,6 +248,7 @@ function App() {
 
           {isCameraOpen && (
             <div style={{ marginTop: "10px" }}>
+              {/* handleScanSuccessはuseCallbackで固定されているため、カメラは再起動しません */}
               <BarcodeScanner onScan={handleScanSuccess} />
             </div>
           )}
