@@ -10,11 +10,9 @@ function App() {
   const [filterText, setFilterText] = useState("");
   const [sortOrder, setSortOrder] = useState("newest");
   
-  // ★追加: スキャン結果を表示するメッセージと、連続読み取り防止用
   const [scanMessage, setScanMessage] = useState("");
-  const lastScannedIsbnRef = useRef(null); // 直前に読んだISBNを記憶
+  const lastScannedIsbnRef = useRef(null);
 
-  // 1. データ取得
   useEffect(() => {
     fetchBooks();
   }, []);
@@ -29,7 +27,6 @@ function App() {
     else setBooks(data);
   };
 
-  // ★ 音を鳴らす関数 (Web Audio API)
   const playBeep = () => {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const oscillator = audioCtx.createOscillator();
@@ -38,15 +35,14 @@ function App() {
     oscillator.connect(gainNode);
     gainNode.connect(audioCtx.destination);
     
-    oscillator.type = 'sine'; // 音の種類（正弦波）
-    oscillator.frequency.setValueAtTime(1000, audioCtx.currentTime); // 高さ(Hz)
-    gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime); // 音量
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(1000, audioCtx.currentTime);
+    gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
     
     oscillator.start();
-    oscillator.stop(audioCtx.currentTime + 0.1); // 0.1秒で止める
+    oscillator.stop(audioCtx.currentTime + 0.1);
   };
 
-  // 2. 追加機能
   const addBookToDB = async (bookData) => {
     let insertData = { status: '未読' };
 
@@ -67,7 +63,6 @@ function App() {
 
     if (error) {
       console.error('Error:', error);
-      // エラー時は音を変えてもいいですが、今回はアラートのみ
     } else {
       fetchBooks();
     }
@@ -85,65 +80,86 @@ function App() {
     else fetchBooks();
   };
 
-  // ★ 4. スキャン成功時の処理（大幅改良）
+  // ★ここが今回の改造のメイン！「ハイブリッド検索」
   const handleScanSuccess = async (isbn) => {
-    // 直前に読んだ本と同じなら無視する（連続反応防止）
-    if (lastScannedIsbnRef.current === isbn) {
-      return; 
-    }
+    if (lastScannedIsbnRef.current === isbn) return;
+    if (!isbn.startsWith("978")) return;
 
-    if (!isbn.startsWith("978")) {
-      return; // ISBN以外は静かに無視
-    }
-
-    // 新しいISBNを記憶
     lastScannedIsbnRef.current = isbn;
-    
-    // 音を鳴らす！
     playBeep();
 
     try {
-      const response = await fetch(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
-      const data = await response.json();
+      // ---------------------------------------------------
+      // 作戦1: まず OpenBD を探す (データが綺麗なので優先)
+      // ---------------------------------------------------
+      const resOpenBD = await fetch(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
+      const dataOpenBD = await resOpenBD.json();
 
-      if (data[0] && data[0].summary) {
-        const bookInfo = data[0].summary;
-        
-        // DBに追加
+      if (dataOpenBD[0] && dataOpenBD[0].summary) {
+        // OpenBDで見つかった場合
+        const bookInfo = dataOpenBD[0].summary;
         await addBookToDB(bookInfo);
+        showSuccessMessage(bookInfo.title);
+        return; // ここで終了（Google Booksには行かない）
+      }
+
+      // ---------------------------------------------------
+      // 作戦2: Google Books API を探す (OpenBDダメだった場合)
+      // ---------------------------------------------------
+      const resGoogle = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`);
+      const dataGoogle = await resGoogle.json();
+
+      if (dataGoogle.items && dataGoogle.items.length > 0) {
+        // Googleで見つかった場合
+        const info = dataGoogle.items[0].volumeInfo;
         
-        // 画面に「追加しました」と出す（アラートではなく画面表示）
-        setScanMessage(`✅ 追加: ${bookInfo.title}`);
-        
-        // 3秒後にメッセージを消し、連続読み取りロックを解除
-        setTimeout(() => {
-          setScanMessage("");
-          lastScannedIsbnRef.current = null; // 3秒経てば同じ本でもまた登録できるようにする
-        }, 3000);
+        // GoogleのデータをOpenBDの形式に合わせる（正規化）
+        const googleBookData = {
+          title: info.title,
+          author: info.authors ? info.authors.join(', ') : '不明', // 配列を文字列に
+          publisher: info.publisher || '不明',
+          // 画像URLの http を https に変換（セキュリティ警告防止）
+          cover: info.imageLinks ? info.imageLinks.thumbnail.replace('http://', 'https://') : '',
+          isbn: isbn
+        };
+
+        await addBookToDB(googleBookData);
+        showSuccessMessage(googleBookData.title);
 
       } else {
+        // ---------------------------------------------------
+        // どちらもダメだった場合
+        // ---------------------------------------------------
         setScanMessage("⚠️ 書籍情報が見つかりませんでした");
+        setTimeout(() => {
+            setScanMessage("");
+            lastScannedIsbnRef.current = null;
+        }, 3000);
       }
+
     } catch (error) {
       console.error("検索エラー:", error);
+      setScanMessage("⚠️ 検索中にエラーが発生しました");
     }
   }
+
+  // メッセージ表示用の便利関数
+  const showSuccessMessage = (title) => {
+    setScanMessage(`✅ 追加: ${title}`);
+    setTimeout(() => {
+      setScanMessage("");
+      lastScannedIsbnRef.current = null;
+    }, 3000);
+  };
 
   const handleStatusChange = async (id, newStatus) => {
     const updatedBooks = books.map(book =>
       book.id === id ? { ...book, status: newStatus } : book
     );
     setBooks(updatedBooks);
-
     const { error } = await supabase
-      .from('books')
-      .update({ status: newStatus })
-      .eq('id', id);
-    
-    if (error) {
-      console.error('Error updating status:', error);
-      fetchBooks();
-    }
+      .from('books').update({ status: newStatus }).eq('id', id);
+    if (error) fetchBooks();
   };
   
   const getDisplayBooks = () => {
@@ -169,10 +185,8 @@ function App() {
   return (
     <>
       <div style={{ padding: "20px", maxWidth: "600px", margin: "0 auto" }}>
-        {/* ★修正: タイトルの色を黒(#333)に指定 */}
-        <h1 style={{ color: "#333" }}>書籍リスト管理 (Scanner v2)</h1>
+        <h1 style={{ color: "#333" }}>書籍リスト管理 (Hybrid Search)</h1>
 
-        {/* 入力エリア */}
         <div style={{ marginBottom: "30px" }}>
           <input
             type="text"
@@ -184,19 +198,17 @@ function App() {
           <button onClick={handleAddBook} style={{ marginLeft: "5px", padding: "8px 15px" }}>追加</button>
         </div>
 
-        {/* カメラボタン & スキャンメッセージ */}
         <div style={{ marginBottom: "20px" }}>
           <button
             onClick={() => setIsCameraOpen(!isCameraOpen)}
             style={{ 
-              backgroundColor: isCameraOpen ? "#ff9800" : "#4CAF50", // 開いているときはオレンジ色に
+              backgroundColor: isCameraOpen ? "#ff9800" : "#4CAF50",
               color: "white", padding: "10px", border: "none", cursor: "pointer", width: "100%", borderRadius: "5px", fontSize: "16px", fontWeight: "bold" 
             }}
           >
             {isCameraOpen ? "カメラを停止する" : "📷 連続スキャンモード開始"}
           </button>
           
-          {/* スキャン中のメッセージ表示エリア */}
           {scanMessage && (
             <div style={{
               marginTop: "10px", padding: "10px", backgroundColor: "#e0f7fa", 
@@ -209,12 +221,11 @@ function App() {
           {isCameraOpen && (
             <div style={{ marginTop: "10px" }}>
               <BarcodeScanner onScan={handleScanSuccess} />
-              <p style={{ fontSize: "12px", color: "#666" }}>カメラをバーコードに向け続けてください（連続登録可能）</p>
+              <p style={{ fontSize: "12px", color: "#666" }}>Google Booksと連携中。古い本も試してみてください。</p>
             </div>
           )}
         </div>
         
-        {/* 検索・並び替えエリア */}
         <div style={{marginBottom:"20px", padding:"15px", backgroundColor:"#f5f5f5", borderRadius:"8px"}}>
           <div style={{marginBottom:"10px"}}>
             <label style={{ color: "#333" }}>🔍 検索: </label>
@@ -240,7 +251,6 @@ function App() {
           </div>
         </div>
 
-        {/* リスト表示エリア */}
         <ul style={{ listStyle: "none", padding: 0 }}>
           {displayBooks.map((book) => (
             <li key={book.id} style={{
