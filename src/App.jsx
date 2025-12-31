@@ -27,20 +27,25 @@ function App() {
     else setBooks(data);
   };
 
+  // 音を鳴らす（エラーが出ても止まらないように安全化）
   const playBeep = () => {
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-    
-    oscillator.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-    
-    oscillator.type = 'sine';
-    oscillator.frequency.setValueAtTime(1000, audioCtx.currentTime);
-    gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
-    
-    oscillator.start();
-    oscillator.stop(audioCtx.currentTime + 0.1);
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(1000, audioCtx.currentTime);
+      gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+      
+      oscillator.start();
+      oscillator.stop(audioCtx.currentTime + 0.1);
+    } catch (e) {
+      console.log("音の再生に失敗しましたが続行します");
+    }
   };
 
   const addBookToDB = async (bookData) => {
@@ -63,6 +68,7 @@ function App() {
 
     if (error) {
       console.error('Error:', error);
+      alert(`保存エラー: ${error.message}`); // エラー内容を表示
     } else {
       fetchBooks();
     }
@@ -80,7 +86,7 @@ function App() {
     else fetchBooks();
   };
 
-  // ★ここが今回の改造のメイン！「ハイブリッド検索」
+  // ★修正: 頑丈になったスキャン処理
   const handleScanSuccess = async (isbn) => {
     if (lastScannedIsbnRef.current === isbn) return;
     if (!isbn.startsWith("978")) return;
@@ -90,36 +96,37 @@ function App() {
 
     try {
       // ---------------------------------------------------
-      // 作戦1: まず OpenBD を探す (データが綺麗なので優先)
+      // 作戦1: OpenBD
       // ---------------------------------------------------
       const resOpenBD = await fetch(`https://api.openbd.jp/v1/get?isbn=${isbn}`);
       const dataOpenBD = await resOpenBD.json();
 
       if (dataOpenBD[0] && dataOpenBD[0].summary) {
-        // OpenBDで見つかった場合
         const bookInfo = dataOpenBD[0].summary;
         await addBookToDB(bookInfo);
         showSuccessMessage(bookInfo.title);
-        return; // ここで終了（Google Booksには行かない）
+        return;
       }
 
       // ---------------------------------------------------
-      // 作戦2: Google Books API を探す (OpenBDダメだった場合)
+      // 作戦2: Google Books API
       // ---------------------------------------------------
       const resGoogle = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`);
       const dataGoogle = await resGoogle.json();
 
       if (dataGoogle.items && dataGoogle.items.length > 0) {
-        // Googleで見つかった場合
         const info = dataGoogle.items[0].volumeInfo;
         
-        // GoogleのデータをOpenBDの形式に合わせる（正規化）
+        // ★ここを修正: 画像情報が無くてもエラーにならないようにチェックを入れる
+        const coverImage = (info.imageLinks && info.imageLinks.thumbnail) 
+          ? info.imageLinks.thumbnail.replace('http://', 'https://') 
+          : '';
+
         const googleBookData = {
-          title: info.title,
-          author: info.authors ? info.authors.join(', ') : '不明', // 配列を文字列に
-          publisher: info.publisher || '不明',
-          // 画像URLの http を https に変換（セキュリティ警告防止）
-          cover: info.imageLinks ? info.imageLinks.thumbnail.replace('http://', 'https://') : '',
+          title: info.title || "タイトル不明",
+          author: info.authors ? info.authors.join(', ') : '著者不明',
+          publisher: info.publisher || '出版社不明',
+          cover: coverImage,
           isbn: isbn
         };
 
@@ -127,30 +134,28 @@ function App() {
         showSuccessMessage(googleBookData.title);
 
       } else {
-        // ---------------------------------------------------
-        // どちらもダメだった場合
-        // ---------------------------------------------------
-        setScanMessage("⚠️ 書籍情報が見つかりませんでした");
-        setTimeout(() => {
-            setScanMessage("");
-            lastScannedIsbnRef.current = null;
-        }, 3000);
+        setScanMessage("⚠️ 情報が見つかりませんでした");
+        resetScanLock();
       }
 
     } catch (error) {
       console.error("検索エラー:", error);
-      setScanMessage("⚠️ 検索中にエラーが発生しました");
+      alert(`エラーが発生しました: ${error.message}`); // 何が起きたか画面に出す
+      resetScanLock();
     }
   }
 
-  // メッセージ表示用の便利関数
   const showSuccessMessage = (title) => {
     setScanMessage(`✅ 追加: ${title}`);
+    resetScanLock();
+  };
+
+  const resetScanLock = () => {
     setTimeout(() => {
       setScanMessage("");
       lastScannedIsbnRef.current = null;
     }, 3000);
-  };
+  }
 
   const handleStatusChange = async (id, newStatus) => {
     const updatedBooks = books.map(book =>
@@ -185,7 +190,7 @@ function App() {
   return (
     <>
       <div style={{ padding: "20px", maxWidth: "600px", margin: "0 auto" }}>
-        <h1 style={{ color: "#333" }}>書籍リスト管理 (Hybrid Search)</h1>
+        <h1 style={{ color: "#333" }}>書籍リスト管理 (Safe v3)</h1>
 
         <div style={{ marginBottom: "30px" }}>
           <input
@@ -221,7 +226,6 @@ function App() {
           {isCameraOpen && (
             <div style={{ marginTop: "10px" }}>
               <BarcodeScanner onScan={handleScanSuccess} />
-              <p style={{ fontSize: "12px", color: "#666" }}>Google Booksと連携中。古い本も試してみてください。</p>
             </div>
           )}
         </div>
