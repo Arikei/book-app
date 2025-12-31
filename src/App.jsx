@@ -7,6 +7,8 @@ function App() {
   const [books, setBooks] = useState([]);
   const [inputText, setInputText] = useState("");
   const [isCameraOpen, setIsCameraOpen] = useState(false);
+  const [filterText, setFilterText] = useState("");
+  const [sortOrder, setSortOrder] = useState("newest");
 
   // 1. データ取得
   useEffect(() => {
@@ -25,13 +27,12 @@ function App() {
   };
 
   // 2. 追加機能（共通）
-  // bookData は「文字列(タイトルのみ)」か「オブジェクト(詳細情報)」のどちらかが来る
   const addBookToDB = async (bookData) => {
-    let insertData = {};
+    let insertData = { status: '未読' }; // デフォルト
 
     if (typeof bookData === 'string') {
       // 手動入力の場合（タイトルだけ保存）
-      insertData = { title: bookData };
+      insertData = { ...insertData, title: bookData };
     } else {
       // スキャンの場合（全データを保存）
       insertData = {
@@ -39,7 +40,8 @@ function App() {
         author: bookData.author,
         publisher: bookData.publisher,
         cover_url: bookData.cover,
-        isbn: bookData.isbn
+        isbn: bookData.isbn,
+        status: '未読'
       };
     }
 
@@ -89,12 +91,8 @@ function App() {
       const data = await response.json();
 
       if (data[0] && data[0].summary) {
-        // APIから返ってきたデータ全体を取得
         const bookInfo = data[0].summary;
-        
-        // 詳細情報オブジェクトをDB保存関数に渡す
         addBookToDB(bookInfo);
-        
         alert(`「${bookInfo.title}」を追加しました!`);
       } else {
         alert("該当する書籍が見つかりませんでした。");
@@ -105,10 +103,53 @@ function App() {
     }
   }
 
+  // ★ 5. ステータス変更機能
+  const handleStatusChange = async (id, newStatus) => {
+    // 画面の表示を即座に更新（サクサク感のため）
+    const updatedBooks = books.map(book =>
+      book.id === id ? { ...book, status: newStatus } : book
+    );
+    setBooks(updatedBooks); // ★ここを修正しました (updateBooks -> updatedBooks)
+
+    // DB更新
+    const { error } = await supabase
+      .from('books')
+      .update({ status: newStatus })
+      .eq('id', id);
+    
+    if (error) {
+      console.error('Error updating status:', error);
+      alert("ステータスの更新に失敗しました");
+      fetchBooks(); // 失敗したら元に戻す
+    }
+  };
+  
+  // ★ 6. 検索・並び替えロジック
+  const getDisplayBooks = () => {
+    let filtered = books.filter(book =>
+      book.title.toLowerCase().includes(filterText.toLowerCase())
+    );
+  
+    if (sortOrder === "newest") {
+      filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    } else if (sortOrder === "oldest") {
+      filtered.sort((a, b) => new Date(a.created_at) - new Date(b.created_at)); // ★ここを修正しました (a,created -> a.created)
+    } else if (sortOrder === "status") {
+      const statusOrder = { "未読": 1, "読書中": 2, "読了": 3 };
+      filtered.sort((a, b) =>
+        (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99)
+      );
+    }
+
+    return filtered;
+  };
+
+  const displayBooks = getDisplayBooks();
+
   return (
     <>
       <div style={{ padding: "20px", maxWidth: "600px", margin: "0 auto" }}>
-        <h1>書籍リスト管理 (詳細版)</h1>
+        <h1>書籍リスト管理 (Status付)</h1>
 
         {/* 入力エリア */}
         <div style={{ marginBottom: "30px" }}>
@@ -134,45 +175,82 @@ function App() {
             <BarcodeScanner onScan={handleScanSuccess} />
           )}
         </div>
+        
+        {/* 検索・並び替えエリア */}
+        <div style={{marginBottom:"20px", padding:"15px", backgroundColor:"#f5f5f5", borderRadius:"8px"}}>
+          <div style={{marginBottom:"10px"}}>
+            <label>🔍 検索: </label>
+            <input
+              type="text"
+              placeholder="タイトルで絞り込み"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              style={{width:"70%", padding:"5px"}}
+            />
+          </div>
+          <div>
+            <label>⇅ 並び替え: </label>
+            <select
+              value={sortOrder}
+              onChange={(e) => setSortOrder(e.target.value)}
+              style={{padding:"5px"}} // ★修正 (paddings -> padding)
+            >
+              <option value="newest">新しい順</option>
+              <option value="oldest">古い順</option> {/* ★修正 (opiton -> option) */}
+              <option value="status">ステータス順</option>
+            </select>
+          </div>
+        </div>
 
         {/* リスト表示エリア */}
         <ul style={{ listStyle: "none", padding: 0 }}>
-          {books.map((book) => (
+          {displayBooks.map((book) => (
             <li key={book.id} style={{
               borderBottom: "1px solid #ddd",
               padding: "15px",
-              display: "flex", // 横並びにする
-              alignItems: "flex-start", // 上揃え
-              gap: "15px", // 画像と文字の間隔
-              backgroundColor: "#fff"
+              display: "flex",
+              alignItems: "flex-start",
+              gap: "15px",
+              backgroundColor: book.status === "読了" ? "#f0f8ff" : "#fff" 
             }}>
-              {/* 表紙画像があれば表示 */}
+              {/* 画像 */}
               {book.cover_url ? (
                 <img src={book.cover_url} alt={book.title} style={{ width: "60px", boxShadow: "2px 2px 5px rgba(0,0,0,0.2)" }} />
               ) : (
                 <div style={{ width: "60px", height: "80px", backgroundColor: "#eee", display:"flex", alignItems:"center", justifyContent:"center", fontSize:"10px", color:"#888" }}>No Image</div>
               )}
 
-              {/* 書籍情報 */}
+              {/* 書籍情報とコントロール */}
               <div style={{ flex: 1, textAlign: "left" }}>
                 <h3 style={{ margin: "0 0 5px 0", fontSize: "16px" }}>{book.title}</h3>
-                
-                {/* 著者と出版社を表示 */}
-                <p style={{ margin: "0", fontSize: "14px", color: "#555" }}>
-                  {book.author ? `著者: ${book.author}` : "著者不明"}
+                <p style={{ margin: "0 0 10px 0", fontSize: "14px", color: "#555" }}>
+                  {book.author}
                 </p>
-                <p style={{ margin: "0", fontSize: "12px", color: "#888" }}>
-                  {book.publisher ? `出版社: ${book.publisher}` : ""}
-                </p>
-              </div>
 
-              {/* 削除ボタン */}
-              <button
-                onClick={() => handleDeleteBook(book.id)}
-                style={{ backgroundColor: "#ff4d4d", color: "white", border: "none", padding: "5px 10px", cursor: "pointer", borderRadius: "4px", alignSelf: "center" }}
-              >
-                削除
-              </button>
+                {/* ステータス選択プルダウン */}
+                <div style={{ marginBottom: "10px" }}>
+                  <select 
+                    value={book.status || "未読"} 
+                    onChange={(e) => handleStatusChange(book.id, e.target.value)}
+                    style={{ 
+                      padding: "5px", 
+                      borderRadius: "4px",
+                      backgroundColor: book.status === "読書中" ? "#fffacd" : (book.status === "読了" ? "#e0ffff" : "#fff")
+                    }}
+                  >
+                    <option value="未読">📕 未読</option>
+                    <option value="読書中">📖 読書中</option>
+                    <option value="読了">✅ 読了</option>
+                  </select>
+                </div>
+
+                <button
+                  onClick={() => handleDeleteBook(book.id)}
+                  style={{ backgroundColor: "#ff4d4d", color: "white", border: "none", padding: "5px 10px", cursor: "pointer", borderRadius: "4px", fontSize: "12px" }}
+                >
+                  削除
+                </button>
+              </div>
             </li>
           ))}
         </ul>
